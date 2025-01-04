@@ -99,7 +99,7 @@ class DatabaseManager:
         except sqlite3.IntegrityError:
             logger.warning(f"User {username} already exists")
             return False
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error adding user: {e}")
             return False
 
@@ -130,7 +130,7 @@ class DatabaseManager:
                     
                     return dict(user)
                 return None
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error verifying user: {e}")
             return None
 
@@ -148,7 +148,7 @@ class DatabaseManager:
                 )
                 conn.commit()
                 return token
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error creating session: {e}")
             return None
 
@@ -168,7 +168,7 @@ class DatabaseManager:
                 
                 user = cursor.fetchone()
                 return dict(user) if user else None
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error verifying session: {e}")
             return None
 
@@ -180,9 +180,25 @@ class DatabaseManager:
                 cursor.execute('DELETE FROM access_tokens WHERE token = ?', (token,))
                 conn.commit()
                 return True
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error invalidating session: {e}")
             return False
+        
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """Get user data by ID (excluding password hash)"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(
+                    'SELECT id, username, role, created_at, last_login, active FROM users WHERE id = ?',
+                    (user_id,)
+                )
+                user = cursor.fetchone()
+                return dict(user) if user else None
+        except sqlite3.Error as e:
+            logger.error(f"Error getting user: {e}")
+            return None
 
     def list_users(self) -> List[Dict]:
         """List all users (excluding password hashes)"""
@@ -196,8 +212,8 @@ class DatabaseManager:
                     ORDER BY username
                 ''')
                 return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error listing users: {e}")
+        except sqlite3.Error as e:
+            logger.error("Error listing users: %s", e)
             return []
 
     def modify_user(self, user_id: int, **kwargs) -> bool:
@@ -242,7 +258,7 @@ class DatabaseManager:
                 )
                 conn.commit()
                 return True
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error deleting user: {e}")
             return False
 
@@ -257,6 +273,6 @@ class DatabaseManager:
                 )
                 conn.commit()
                 return cursor.rowcount
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"Error cleaning up sessions: {e}")
             return 0
