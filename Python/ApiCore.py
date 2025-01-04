@@ -25,24 +25,27 @@ Dependencies:
     - typing
     - secrets
 """
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS
-import json
-import os
+# ApiCore.py
 import hashlib
-from functools import wraps
-from ApiUtils import rate_limit, validate_file_type, log_access, require_json
-from typing import Callable
+import os
 import secrets
+from functools import wraps
+import json
+from ApiDatabase import DatabaseManager
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
+from ApiUtils import rate_limit, validate_file_type, log_access, require_json
 
 class CoreApi:
     def __init__(self):
         self.app = Flask(__name__)
+        self.db = DatabaseManager()
+        
         CORS(self.app, 
-             supports_credentials=True,  # Important for cookies
+             supports_credentials=True,  # Keep this for cookies
              resources={
                  r"/*": {
-                     "origins": ["http://odamex.zerofuchs.co.za:443", "https://odamex.zerofuchs.co.za:443"],  # Add your domains
+                     "origins": ["http://odamex.zerofuchs.co.za:443", "https://odamex.zerofuchs.co.za:443"],
                      "methods": ["GET", "POST", "OPTIONS"],
                      "allow_headers": ["Content-Type", "Authorization"],
                      "expose_headers": ["Content-Range", "X-Content-Range"],
@@ -58,54 +61,53 @@ class CoreApi:
         self.app.config['SERVICE_CONFIG_FOLDER'] = '/service-configs'
         self.app.config['CONFIG_FOLDER'] = '/configs'
         
-        # Session configuration
+        # Session configuration - still needed for cookie handling
         self.app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-        self.app.config['SESSION_COOKIE_SECURE'] = True
-        self.app.config['SESSION_COOKIE_HTTPONLY'] = True
-        self.app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
-        self.app.config['PERMANENT_SESSION_LIFETIME'] = 3600  # 1 hour
-
-        # Load users on startup
-        self.reload_users()
         
-        # Register routes
         self._register_routes()
 
-    def reload_users(self):
-        """Load users from JSON file"""
-        users_file = os.path.join(self.app.config['SERVICE_CONFIG_FOLDER'], "users.json")
-        print(f"Attempting to load users from: {users_file}")
-        
-        if os.path.exists(users_file):
-            try:
-                with open(users_file, 'r') as f:
-                    data = json.load(f)
-                    print(f"Loaded data: {data}")  # Debug
-                    if isinstance(data, dict) and 'users' in data:
-                        self.users = data['users']  # Get the users array
-                    else:
-                        print("Invalid users file format")
-                        self.users = []
-            except Exception as e:
-                print(f"Error loading users: {e}")
-                self.users = []
-        else:
-            print(f"Users file not found at {users_file}")
-            self.users = []
-
-    def require_auth(self, f: Callable):
+    def require_auth(self, f):
         """Authentication requirement decorator"""
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            if not session.get('user_id'):
+            token = request.cookies.get('session_token')
+            if not token:
                 return jsonify({'error': 'Authentication required'}), 401
+            
+            user = self.db.verify_session(token)
+            if not user:
+                response = make_response(jsonify({'error': 'Invalid session'}), 401)
+                response.delete_cookie('session_token')
+                return response
+                
             return f(*args, **kwargs)
         return decorated_function
+    
+    def require_role(self, role):
+        """Role requirement decorator"""
+        def decorator(f):
+            @wraps(f)
+            def decorated_function(*args, **kwargs):
+                token = request.cookies.get('session_token')
+                if not token:
+                    return jsonify({'error': 'Authentication required'}), 401
+                
+                user = self.db.verify_session(token)
+                if not user:
+                    response = make_response(jsonify({'error': 'Invalid session'}), 401)
+                    response.delete_cookie('session_token')
+                    return response
+                
+                if user['role'] != role:
+                    return jsonify({'error': 'Insufficient permissions'}), 403
+                
+                return f(*args, **kwargs)
+            return decorated_function
+        return decorator
 
     def _register_routes(self):
         """Register all API routes"""
         
-        # Auth routes
         @self.app.route('/auth/login', methods=['POST'])
         @rate_limit(requests_per_window=5, window_seconds=60)
         @require_json()
@@ -115,49 +117,64 @@ class CoreApi:
             username = data.get('username')
             password = data.get('password')
             
-            # Hash password for comparison
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            
-            user = next(
-                (user for user in self.users 
-                 if user['username'] == username and 
-                 user['password_hash'] == password_hash),
-                None
-            )
-            
+            user = self.db.verify_user(username, password)
             if user:
-                session.permanent = True
-                session['user_id'] = user['id']
-                session['username'] = user['username']
-                session['role'] = user['role']
-                
-                return jsonify({
+                token = self.db.create_session(user['id'])
+                if not token:
+                    return jsonify({"error": "Could not create session"}), 500
+                    
+                response = jsonify({
                     "message": "Login successful",
                     "user": {
                         "username": user['username'],
                         "role": user['role']
                     }
-                }), 200
+                })
+                
+                # Set secure cookie with token
+                response.set_cookie(
+                    'session_token',
+                    token,
+                    httponly=True,
+                    secure=True,
+                    samesite='Strict',
+                    max_age=3600  # 1 hour
+                )
+                
+                return response, 200
             return jsonify({"error": "Invalid credentials"}), 401
 
         @self.app.route('/auth/logout', methods=['POST'])
         def logout():
-            session.clear()
-            return jsonify({"message": "Logout successful"}), 200
+            token = request.cookies.get('session_token')
+            if token:
+                self.db.invalidate_session(token)
+            
+            response = jsonify({"message": "Logout successful"})
+            response.delete_cookie('session_token')
+            return response
 
         @self.app.route('/auth/session', methods=['GET'])
         def check_session():
-            if session.get('user_id'):
+            token = request.cookies.get('session_token')
+            if not token:
+                return jsonify({"authenticated": False}), 401
+                
+            user = self.db.verify_session(token)
+            if user:
                 return jsonify({
                     "authenticated": True,
                     "user": {
-                        "username": session.get('username'),
-                        "role": session.get('role')
+                        "username": user['username'],
+                        "role": user['role']
                     }
                 }), 200
-            return jsonify({"authenticated": False}), 401
+                
+            response = make_response(jsonify({"authenticated": False}), 401)
+            response.delete_cookie('session_token')
+            return response
 
-        # WAD management routes
+        # WAD management routes with auth requirement
         @self.app.route('/submit-wad', methods=['POST'])
         @self.require_auth
         @rate_limit(requests_per_window=10, window_seconds=60)
@@ -173,13 +190,13 @@ class CoreApi:
                      if 'iwad' in request.form and request.form['iwad'].lower() == 'true' 
                      else self.app.config['UPLOAD_FOLDER'])
 
-            # File hash calculation and commercial IWAD checking
+            # Handle commercial IWAD checking
             file_content = file.read()
-            calculated_hash = hashlib.sha256(file_content).hexdigest().lower()
-            file.seek(0)
+            file_hash = hashlib.sha256(file_content).hexdigest().lower()
+            file.seek(0)  # Reset file pointer
 
             if folder == self.app.config['UPLOAD_FOLDER']:
-                commercial_check = self._check_commercial_wad(filename, calculated_hash)
+                commercial_check = self._check_commercial_wad(filename, file_hash)
                 if commercial_check:
                     return commercial_check
 
@@ -187,10 +204,10 @@ class CoreApi:
             return jsonify({
                 'message': 'File uploaded successfully',
                 'filename': filename,
-                'hash': calculated_hash
+                'hash': file_hash
             }), 200
 
-        # List type routes
+        # List routes
         @self.app.route('/list-configs', methods=['GET'])
         @self.require_auth
         @rate_limit(requests_per_window=30, window_seconds=60)
@@ -207,7 +224,7 @@ class CoreApi:
         def list_pwads():
             wads = [f for f in os.listdir(self.app.config['UPLOAD_FOLDER']) 
                    if f.lower().endswith('.wad')]
-            wads.insert(0, '')
+            wads.insert(0, '')  # Add empty option
             return jsonify(wads)
 
         @self.app.route('/list-iwads', methods=['GET'])
@@ -247,6 +264,29 @@ class CoreApi:
         
             return jsonify({
                 'message': 'Configuration saved',
+                'configs': configs,
+                'pwads': pwads,
+                'iwads': iwads
+            }), 200
+        
+        @self.app.route('/delete-config', methods=['POST'])
+        @self.require_role('admin')
+        @self.require_auth
+        @rate_limit(requests_per_window=20, window_seconds=60)
+        @require_json()
+        @log_access()
+        def delete_config():
+            config_name = request.json.get('configFile')
+            config_path = os.path.join(self.app.config['SERVICE_CONFIG_FOLDER'], config_name)
+            if os.path.exists(config_path):
+                os.remove(config_path)
+        
+            configs = [f for f in os.listdir(self.app.config['CONFIG_FOLDER']) if f.lower().endswith('.cfg')]
+            pwads = [f for f in os.listdir(self.app.config['UPLOAD_FOLDER']) if f.lower().endswith('.wad')]
+            iwads = [f for f in os.listdir(self.app.config['IWAD_FOLDER']) if f.lower().endswith('.wad')]
+        
+            return jsonify({
+                'message': 'Configuration deleted',
                 'configs': configs,
                 'pwads': pwads,
                 'iwads': iwads
