@@ -30,10 +30,17 @@ import secrets
 from typing import Optional, List, Dict
 import logging
 from datetime import datetime
+import string
 
 logger = logging.getLogger('api_database')
 
 class DatabaseManager:
+    STATIC_SALT = "D0ck3rM3x!"  # Constant salt
+    PEPPER_SUBSTITUTIONS = str.maketrans(
+        string.ascii_letters + string.digits,
+        string.ascii_letters[::-1] + string.digits[::-1]
+    )
+
     def __init__(self, db_path: str = '/sqlite/users.db'):
         self.db_path = db_path
         self._init_db()
