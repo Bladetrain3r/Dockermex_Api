@@ -208,6 +208,7 @@ class CoreApi:
             }), 200
 
         # List routes
+
         @self.app.route('/list-configs', methods=['GET'])
         @self.require_auth
         @rate_limit(requests_per_window=30, window_seconds=60)
@@ -241,6 +242,8 @@ class CoreApi:
                 if f.lower().endswith('.wad') and not f.lower().startswith('odamex')
             ]
             return jsonify(wads + commercial_wads)
+        
+        # Configuration routes
         
         @self.app.route('/generate-config', methods=['POST'])
         @self.require_auth
