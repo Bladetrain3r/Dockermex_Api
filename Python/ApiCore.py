@@ -173,6 +173,29 @@ class CoreApi:
             response = make_response(jsonify({"authenticated": False}), 401)
             response.delete_cookie('session_token')
             return response
+        
+        # Admin routes
+        
+        @self.app.route('/admin/users', methods=['GET'])
+        @self.require_role('admin')
+        def list_users():
+            users = self.db.list_users()
+            for user in users:
+                user['storage_used'] = self.db.get_user_storage_usage(user['id'])
+                user['storage_limit'] = self.db.STORAGE_LIMITS[user['role']]
+            return jsonify(users)
+        
+        @self.app.route('/admin/wads', methods=['GET'])
+        @self.require_role('admin')
+        def list_wads():
+            wads = self.db.get_all_wads() # Need to add this method
+            return jsonify(wads)
+        
+        @self.app.route('/admin/configs', methods=['GET'])
+        @self.require_role('admin')
+        def list_configs():
+            configs = self.db.get_active_configs()
+            return jsonify(configs)
 
         # WAD management routes with auth requirement
         @self.app.route('/submit-wad', methods=['POST'])
@@ -183,28 +206,73 @@ class CoreApi:
         def upload_file():
             if 'file' not in request.files:
                 return jsonify({'error': 'No file provided'}), 400
-
+        
+            token = request.cookies.get('session_token')
+            user = self.db.verify_session(token)
+            if not user:
+                return jsonify({'error': 'Invalid session'}), 401
+        
             file = request.files['file']
             filename = file.filename.strip()
-            folder = (self.app.config['IWAD_FOLDER'] 
-                     if 'iwad' in request.form and request.form['iwad'].lower() == 'true' 
-                     else self.app.config['UPLOAD_FOLDER'])
-
-            # Handle commercial IWAD checking
+            
+            # Determine if this is an IWAD upload
+            is_iwad = 'iwad' in request.form and request.form['iwad'].lower() == 'true'
+            folder = self.app.config['IWAD_FOLDER'] if is_iwad else self.app.config['UPLOAD_FOLDER']
+        
+            # Get file size and hash
+            file.seek(0, 2)  # Seek to end
+            filesize = file.tell()  # Get position (size)
+            file.seek(0)  # Reset to beginning
+            
+            # Check storage limits for non-admin users
+            if user['role'] != 'admin':
+                if not self.db.can_upload_file(user['id'], filesize):
+                    return jsonify({'error': 'Storage limit exceeded'}), 403
+        
+            # Calculate hash
             file_content = file.read()
             file_hash = hashlib.sha256(file_content).hexdigest().lower()
-            file.seek(0)  # Reset file pointer
-
+            file.seek(0)  # Reset file pointer again
+        
+            # Check for commercial WAD conflicts
             if folder == self.app.config['UPLOAD_FOLDER']:
                 commercial_check = self._check_commercial_wad(filename, file_hash)
                 if commercial_check:
                     return commercial_check
-
-            file.save(os.path.join(folder, filename))
+        
+            # Save the file
+            upload_path = os.path.join(folder, filename)
+            try:
+                file.save(upload_path)
+            except Exception as e:
+                return jsonify({'error': f'Failed to save file: {str(e)}'}), 500
+        
+            # Register WAD in database
+            wad_id = self.db.register_wad(
+                filename=filename,
+                hash=file_hash,
+                upload_path=upload_path,
+                wad_type='IWAD' if is_iwad else 'PWAD',
+                uploader_id=user['id'],
+                filesize=filesize,
+                description=request.form.get('description', ''),
+                is_commercial=False
+            )
+        
+            if not wad_id:
+                # If database registration fails, try to remove the file
+                try:
+                    os.remove(upload_path)
+                except ValueError as e:
+                    print("%s", e)  # Already in error state, ignore cleanup failure
+                return jsonify({'error': 'Failed to register WAD in database'}), 500
+        
             return jsonify({
                 'message': 'File uploaded successfully',
                 'filename': filename,
-                'hash': file_hash
+                'hash': file_hash,
+                'wad_id': wad_id,
+                'size': filesize
             }), 200
 
         # List routes

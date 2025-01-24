@@ -41,6 +41,17 @@ class DatabaseManager:
         string.ascii_letters[::-1] + string.digits[::-1]
     )
 
+    ROLE_GUEST = 'guest'
+    ROLE_USER = 'user'
+    ROLE_ADMIN = 'admin'
+    
+    # Storage limits (in bytes)
+    STORAGE_LIMITS = {
+        ROLE_GUEST: 0,  # Guests can't upload
+        ROLE_USER: 100 * 1024 * 1024,  # 100MB
+        ROLE_ADMIN: 0  # Unlimited
+    }
+
     def __init__(self, db_path: str = '/sqlite/users.db'):
         self.db_path = db_path
         self._init_db()
@@ -73,6 +84,52 @@ class DatabaseManager:
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         expires_at TIMESTAMP NOT NULL,
                         FOREIGN KEY (user_id) REFERENCES users (id)
+                    )
+                ''')
+
+                # WADs table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS wads (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        filename TEXT NOT NULL,
+                        hash TEXT NOT NULL,
+                        upload_path TEXT NOT NULL,
+                        type TEXT NOT NULL,  -- 'PWAD' or 'IWAD'
+                        uploader_id INTEGER,
+                        upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expiry_date TIMESTAMP,
+                        filesize INTEGER NOT NULL,
+                        is_commercial BOOLEAN DEFAULT 0,
+                        description TEXT,
+                        FOREIGN KEY (uploader_id) REFERENCES users (id)
+                    )
+                ''')
+                
+                # WAD access permissions table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS wad_permissions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        wad_id INTEGER,
+                        user_id INTEGER,
+                        can_read BOOLEAN DEFAULT 1,
+                        can_delete BOOLEAN DEFAULT 0,
+                        FOREIGN KEY (wad_id) REFERENCES wads (id),
+                        FOREIGN KEY (user_id) REFERENCES users (id)
+                    )
+                ''')
+
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS configs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        creator_id INTEGER,
+                        created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expiry_date TIMESTAMP,
+                        wad_id INTEGER,
+                        is_permanent BOOLEAN DEFAULT 0,
+                        config_data TEXT NOT NULL,
+                        FOREIGN KEY (creator_id) REFERENCES users (id),
+                        FOREIGN KEY (wad_id) REFERENCES wads (id)
                     )
                 ''')
                 
@@ -275,4 +332,224 @@ class DatabaseManager:
                 return cursor.rowcount
         except sqlite3.Error as e:
             logger.error(f"Error cleaning up sessions: {e}")
+            return 0  
+               
+    def get_user_storage_usage(self, user_id: int) -> int:
+        """Get total storage used by user in bytes"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT COALESCE(SUM(filesize), 0)
+                    FROM wads
+                    WHERE uploader_id = ? AND (expiry_date IS NULL OR expiry_date > CURRENT_TIMESTAMP)
+                ''', (user_id,))
+                return cursor.fetchone()[0]
+        except sqlite3.Error as e:
+            logger.error(f"Error getting storage usage: {e}")
             return 0
+
+    def can_upload_file(self, user_id: int, filesize: int) -> bool:
+        """Check if user can upload file of given size"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Get user role
+                cursor.execute('SELECT role FROM users WHERE id = ?', (user_id,))
+                role = cursor.fetchone()[0]
+                
+                # Admins have no limit
+                if role == self.ROLE_ADMIN:
+                    return True
+                    
+                # Guests can't upload
+                if role == self.ROLE_GUEST:
+                    return False
+                
+                # Check user's limit
+                limit = self.STORAGE_LIMITS.get(role, 0)
+                if limit == 0:
+                    return False
+                    
+                current_usage = self.get_user_storage_usage(user_id)
+                return (current_usage + filesize) <= limit
+                
+        except sqlite3.Error as e:
+            logger.error(f"Error checking upload capability: {e}")
+            return False
+
+    def register_wad(self, filename: str, hash: str, upload_path: str, 
+                     wad_type: str, uploader_id: int, filesize: int,
+                     description: str = None, is_commercial: bool = False) -> Optional[int]:
+        """Register a new WAD with size tracking"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Get user role
+                cursor.execute('SELECT role FROM users WHERE id = ?', (uploader_id,))
+                role = cursor.fetchone()[0]
+                
+                # Set expiry based on role
+                expiry_date = None
+                if role == self.ROLE_GUEST:
+                    expiry_date = 'datetime("now", "+1 day")'
+                elif role == self.ROLE_USER:
+                    expiry_date = 'datetime("now", "+7 days")'
+                
+                cursor.execute('''
+                    INSERT INTO wads 
+                    (filename, hash, upload_path, type, uploader_id, description, 
+                     is_commercial, filesize, expiry_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (filename, hash, upload_path, wad_type, uploader_id, 
+                      description, is_commercial, filesize, expiry_date))
+                
+                wad_id = cursor.lastrowid
+                
+                # Add default permission
+                cursor.execute('''
+                    INSERT INTO wad_permissions (wad_id, user_id, can_read, can_delete)
+                    VALUES (?, ?, 1, 1)
+                ''', (wad_id, uploader_id))
+                
+                conn.commit()
+                return wad_id
+                
+        except sqlite3.Error as e:
+            logger.error(f"Error registering WAD: {e}")
+            return None
+
+    def create_config(self, name: str, creator_id: int, config_data: str,
+                     wad_id: Optional[int] = None) -> Optional[int]:
+        """Create a new configuration"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Get creator role
+                cursor.execute('SELECT role FROM users WHERE id = ?', (creator_id,))
+                role = cursor.fetchone()[0]
+                
+                # Set permanence and expiry based on role
+                is_permanent = (role == self.ROLE_ADMIN)
+                expiry_date = None
+                if role == self.ROLE_GUEST:
+                    expiry_date = 'datetime("now", "+1 day")'
+                elif role == self.ROLE_USER:
+                    expiry_date = 'datetime("now", "+7 days")'
+                
+                cursor.execute('''
+                    INSERT INTO configs 
+                    (name, creator_id, wad_id, config_data, is_permanent, expiry_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (name, creator_id, wad_id, config_data, is_permanent, expiry_date))
+                
+                conn.commit()
+                return cursor.lastrowid
+                
+        except sqlite3.Error as e:
+            logger.error(f"Error creating config: {e}")
+            return None
+
+    def can_access_commercial_wad(self, user_id: int) -> bool:
+        """Check if user can access commercial WADs"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT role FROM users WHERE id = ?', (user_id,))
+                role = cursor.fetchone()[0]
+                return role in (self.ROLE_USER, self.ROLE_ADMIN)
+        except sqlite3.Error as e:
+            logger.error(f"Error checking commercial WAD access: {e}")
+            return False
+
+    def get_active_configs(self, user_id: Optional[int] = None) -> List[Dict]:
+        """Get non-expired configurations"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                
+                query = '''
+                    SELECT c.*, u.username as creator_name
+                    FROM configs c
+                    JOIN users u ON c.creator_id = u.id
+                    WHERE (c.expiry_date IS NULL OR c.expiry_date > CURRENT_TIMESTAMP)
+                '''
+                params = []
+                
+                if user_id is not None:
+                    query += ' AND c.creator_id = ?'
+                    params.append(user_id)
+                
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
+                
+        except sqlite3.Error as e:
+            logger.error(f"Error getting configs: {e}")
+            return []
+        
+    def get_all_wads(self) -> List[Dict]:
+        """Get all WADs with uploader info"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT w.*, u.username as uploader_name
+                    FROM wads w
+                    JOIN users u ON w.uploader_id = u.id
+                    ORDER BY w.upload_date DESC
+                ''')
+                return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Error getting all WADs: {e}")
+            return []
+    
+    def edit_wad(self, wad_id: int, **kwargs) -> bool:
+        """Edit WAD properties"""
+        allowed_fields = {'expiry_date', 'description'}
+        update_fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        
+        if not update_fields:
+            return False
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                set_clause = ', '.join(f'{k} = ?' for k in update_fields)
+                values = tuple(update_fields.values()) + (wad_id,)
+                cursor.execute(
+                    f'UPDATE wads SET {set_clause} WHERE id = ?',
+                    values
+                )
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            logger.error(f"Error editing WAD: {e}")
+            return False
+    
+    def edit_config(self, config_id: int, **kwargs) -> bool:
+        """Edit configuration properties"""
+        allowed_fields = {'expiry_date', 'is_permanent', 'name'}
+        update_fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        
+        if not update_fields:
+            return False
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                set_clause = ', '.join(f'{k} = ?' for k in update_fields)
+                values = tuple(update_fields.values()) + (config_id,)
+                cursor.execute(
+                    f'UPDATE configs SET {set_clause} WHERE id = ?',
+                    values
+                )
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            logger.error(f"Error editing config: {e}")
+            return False
