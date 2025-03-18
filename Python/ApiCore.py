@@ -175,7 +175,6 @@ class CoreApi:
             return response
         
         # Admin routes
-        
         @self.app.route('/admin/users', methods=['GET'])
         @self.require_role('admin')
         def list_users():
