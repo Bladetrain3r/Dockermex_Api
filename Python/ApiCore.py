@@ -35,6 +35,7 @@ from ApiDatabase import DatabaseManager
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from ApiUtils import rate_limit, validate_file_type, log_access, require_json
+from ApiAdmin import admin_bp
 
 class CoreApi:
     def __init__(self):
@@ -65,6 +66,7 @@ class CoreApi:
         self.app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
         
         self._register_routes()
+        self.app.register_blueprint(admin_bp)
 
     def require_auth(self, f):
         """Authentication requirement decorator"""
@@ -174,28 +176,6 @@ class CoreApi:
             response.delete_cookie('session_token')
             return response
         
-        # Admin routes
-        @self.app.route('/admin/users', methods=['GET'])
-        @self.require_role('admin')
-        def list_users():
-            users = self.db.list_users()
-            for user in users:
-                user['storage_used'] = self.db.get_user_storage_usage(user['id'])
-                user['storage_limit'] = self.db.STORAGE_LIMITS[user['role']]
-            return jsonify(users)
-        
-        @self.app.route('/admin/wads', methods=['GET'])
-        @self.require_role('admin')
-        def list_wads():
-            wads = self.db.get_all_wads() # Need to add this method
-            return jsonify(wads)
-        
-        @self.app.route('/admin/configs', methods=['GET'])
-        @self.require_role('admin')
-        def list_configs():
-            configs = self.db.get_active_configs()
-            return jsonify(configs)
-
         # WAD management routes with auth requirement
         @self.app.route('/submit-wad', methods=['POST'])
         @self.require_auth

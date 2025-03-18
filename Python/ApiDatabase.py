@@ -309,6 +309,7 @@ class DatabaseManager:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 # Soft delete - just set inactive
+                # Todo: Hard delete if already inactive
                 cursor.execute(
                     'UPDATE users SET active = 0 WHERE id = ?',
                     (user_id,)
