@@ -46,7 +46,7 @@ class CoreApi:
              supports_credentials=True,  # Keep this for cookies
              resources={
                  r"/*": {
-                     "origins": ["http://odamex.zerofuchs.co.za:443", "https://odamex.zerofuchs.co.za:443"],
+                     "origins": ["http://odamex.zerofuchs.local:443", "https://odamex.zerofuchs.local:443"],
                      "methods": ["GET", "POST", "OPTIONS"],
                      "allow_headers": ["Content-Type", "Authorization"],
                      "expose_headers": ["Content-Range", "X-Content-Range"],
