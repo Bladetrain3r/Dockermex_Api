@@ -23,7 +23,7 @@ Dependencies:
     - logging
     - datetime
 """
-
+import os
 import sqlite3
 import hashlib
 import secrets
@@ -35,7 +35,7 @@ import string
 logger = logging.getLogger('api_database')
 
 class DatabaseManager:
-    STATIC_SALT = "D0ck3rM3x!"  # Constant salt
+    STATIC_SALT = os.environ.get('DB_SALT', 'D0ck3rM3x!')  # Constant salt
     PEPPER_SUBSTITUTIONS = str.maketrans(
         string.ascii_letters + string.digits,
         string.ascii_letters[::-1] + string.digits[::-1]
@@ -61,6 +61,8 @@ class DatabaseManager:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+
+
                 
                 # Users table
                 cursor.execute('''
@@ -74,6 +76,11 @@ class DatabaseManager:
                         active BOOLEAN DEFAULT 1
                     )
                 ''')
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+                if cursor.fetchone()[0] == 0:
+                    admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
+                    self.add_user('admin', admin_pass, 'admin')
                 
                 # Access tokens table for session management
                 cursor.execute('''
